@@ -1,0 +1,78 @@
+name: SyntheticForkEnvironmentBoundary
+
+on:
+  pull_request:
+    types: [opened]
+
+permissions:
+  contents: read
+
+jobs:
+  environment-boundary:
+    runs-on: ubuntu-latest
+    environment: synthetic-prod
+    steps:
+      - name: Record fork environment facts
+        env:
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          BASE_REPOSITORY: ${{ github.repository }}
+          EVENT_ACTION: ${{ github.event.action }}
+          EVENT_REF: ${{ github.ref }}
+        run: |
+          echo "EVENT_ACTION=$EVENT_ACTION"
+          echo "EVENT_REF=$EVENT_REF"
+          echo "EXPECTED_HEAD_SHA=$EXPECTED_HEAD_SHA"
+          echo "HEAD_REPOSITORY=$HEAD_REPOSITORY"
+          echo "BASE_REPOSITORY=$BASE_REPOSITORY"
+          echo "ENVIRONMENT_NAME=synthetic-prod"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Run bounded fork environment payload
+        env:
+          ENV_SECRET: ${{ secrets.SYNTHETIC_ENV_SECRET }}
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          BASE_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EVENT_ACTION: ${{ github.event.action }}
+          EVIDENCE_PATH: ${{ runner.temp }}/fork-environment-proof.json
+        run: node .github/fork-environment-payload.cjs
+
+      - name: Independently verify environment confidentiality decision
+        env:
+          ENV_SECRET: ${{ secrets.SYNTHETIC_ENV_SECRET }}
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EVIDENCE_PATH: ${{ runner.temp }}/fork-environment-proof.json
+        run: |
+          node <<'NODE'
+          const crypto = require('node:crypto')
+          const fs = require('node:fs')
+          const evidence = JSON.parse(fs.readFileSync(process.env.EVIDENCE_PATH, 'utf8'))
+          if (evidence.payload_id !== 'fork-environment-hash-only-v1') throw new Error('Unexpected payload identity')
+          if (evidence.head_sha !== process.env.EXPECTED_HEAD_SHA) throw new Error('Expected head binding missing from payload context')
+          console.log('PAYLOAD_CONTEXT=' + JSON.stringify({secret_present: evidence.secret_present, head_sha: evidence.head_sha, head_repository: evidence.head_repository, base_repository: evidence.base_repository, pr_number: evidence.pr_number, event_action: evidence.event_action}))
+          if (!process.env.ENV_SECRET) {
+            if (evidence.secret_present !== false) throw new Error('Payload/verifier secret-presence decision mismatch')
+            console.log('ENV_SECRET_WITHHELD=true')
+          } else {
+            const expected = crypto.createHash('sha256').update(process.env.ENV_SECRET).digest('hex')
+            const checks = {
+              secretPresent: evidence.secret_present === true,
+              exactHash: evidence.secret_sha256 === expected,
+              exactHead: evidence.head_sha === process.env.EXPECTED_HEAD_SHA,
+              forkOrigin: evidence.head_repository === 'captainsandeep10-hash/environment-fork-main-c82f19ad',
+              baseOrigin: evidence.base_repository === 'Sanu1999/environment-fork-main-c82f19ad',
+              exactPr: evidence.pr_number === 1,
+              openedEvent: evidence.event_action === 'opened'
+            }
+            console.log('ASSERTIONS=' + JSON.stringify(checks))
+            if (Object.values(checks).some(value => value !== true)) throw new Error('Unexpected protected environment access was not fully bound')
+            console.log('PROTECTED_ENV_SECRET_HASH_MATCH=true')
+          }
+          console.log('SECRET_PLAINTEXT_LOGGED=false')
+          NODE
